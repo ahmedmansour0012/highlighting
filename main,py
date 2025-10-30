@@ -1,0 +1,2079 @@
+# Functionality
+
+## PDF to Image Conversion
+
+import fitz
+
+def convert_pdf_with_pymupdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    images = []
+    for page_number in range(len(doc)):
+        page = doc.load_page(page_number)
+        pixmap = page.get_pixmap(dpi=180)
+
+        # Convert pixmap to a PIL Image object
+        img = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+        images.append(img)
+
+    doc.close()
+    return images
+
+# images = convert_pdf_with_pymupdf('/content/sq2.pdf')
+
+## Layout Detection
+
+import cv2
+from doclayout_yolo import YOLOv10
+from huggingface_hub import hf_hub_download
+
+filepath = hf_hub_download(repo_id="opendatalab/PDF-Extract-Kit-1.0", filename="models/Layout/YOLO/doclayout_yolo_docstructbench_imgsz1280_2501.pt")
+model = YOLOv10(filepath)
+
+def layout_detect(model,images):
+    det_res = model.predict(
+      images,   # Image to predict
+      imgsz=1024,        # Prediction image size
+      conf=0.1,          # Confidence threshold
+      device="cpu" ,   # Device to use (e.g., 'cuda:0' or 'cpu')
+      )
+    return det_res
+
+
+import cv2
+import torch
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+from doclayout_yolo.utils.ops import xyxy2xywh, xywh2xyxy, clip_boxes
+
+def get_sorted_detections(det_result):
+    """
+    Retrieves and sorts detection results by squared distance from the top-left corner.
+    """
+    detections = det_result.summary(normalize=False)
+    if not detections:
+        print("No detections found")
+        return []
+
+    detections.sort(key=lambda d: (d["box"]["x1"]**2 + d["box"]["y1"]**2))
+    return detections
+
+
+
+
+def crop_region(img_array, box, gain=1.01, pad=2):
+    """
+    Crops a region from a numpy image array given a bounding box.
+    Allows optional expansion via gain/pad and conversion to square.
+
+    Args:
+        img_array (np.ndarray): The input image as a NumPy array (H, W, C).
+        box (dict or list or torch.Tensor): Bounding box in [x1, y1, x2, y2] format.
+        gain (float): Multiplier to expand the box size.
+        pad (int): Additional pixels to add to width/height.
+    Returns:
+        np.ndarray: The cropped image.
+    """
+    # Convert box to tensor if needed
+    if not isinstance(box, torch.Tensor):
+        if isinstance(box, dict):
+            x1, y1, x2, y2 = map(int, [box["x1"], box["y1"], box["x2"], box["y2"]])
+        else:
+            x1, y1, x2, y2 = map(int, box)
+        box = torch.tensor([[x1, y1, (x2), y2]])
+
+    # Convert xyxy -> xywh
+    b = xyxy2xywh(box.view(-1, 4))
+
+    # Apply gain and padding
+    b[:, 2:] = b[:, 2:] * gain + pad
+
+    # Back to xyxy
+    xyxy = xywh2xyxy(b).long()
+
+    # Clip coordinates to image bounds
+    xyxy = clip_boxes(xyxy, img_array.shape)
+
+    # Crop image
+    crop = img_array[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2])]
+
+    # Add black line at the top
+    crop[0, :] = 0
+
+    # crop.save(f"header_section.png")
+    return crop
+
+def visualize_crop(cropped, idx, label, confidence):
+    """
+    Displays a cropped image region with matplotlib.
+    """
+    plt.figure(figsize=(4, 4))
+    plt.imshow(cropped)
+    title = f"{idx+1}. {label} (Conf: {confidence:.2f})"
+    plt.title(title)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+def crop_and_visualize_sorted_detections(det_result, pil_image):
+    """
+    Coordinates the detection sorting, cropping, and visualization.
+    """
+    detections = get_sorted_detections(det_result)
+    if not detections:
+        return
+
+    img_array = np.array(pil_image)
+
+    for idx, det in enumerate(detections):
+        try:
+            cropped = crop_region(img_array, det["box"])
+            visualize_crop(cropped, idx, det["name"], det["confidence"])
+        except Exception as e:
+            print(f"Error processing detection {idx+1}: {e}")
+
+
+from PIL import Image
+from surya.layout import LayoutPredictor
+
+# Initialize once (can be reused across calls)
+layout_predictor = LayoutPredictor()
+
+def istable(image_arr) -> bool:
+    """
+    Detect whether the given image contains a table
+    using Surya's LayoutPredictor.
+
+    Args:
+        image_arr: A NumPy array or PIL.Image representing the image.
+
+    Returns:
+        bool: True if a table-like region is detected, False otherwise.
+    """
+    # Ensure PIL Image
+    if not isinstance(image_arr, Image.Image):
+        image = Image.fromarray(image_arr)
+    else:
+        image = image_arr
+
+    # Run prediction
+    layout_predictions = layout_predictor([image])
+
+    # Each prediction has .bboxes with .label
+    prediction = layout_predictions[0]
+
+    # Check if any detected object is labeled "table"
+    labels = [bbox.label.lower() for bbox in prediction.bboxes]
+    return any("table" in lbl for lbl in labels)
+
+
+# rec_res =layout_detect(model,selected_images)
+
+## OCR Processing
+
+from paddleocr import PaddleOCR
+
+ocr = PaddleOCR(
+    lang="en",
+    text_detection_model_name="PP-OCRv5_mobile_det",
+    text_recognition_model_name="PP-OCRv5_mobile_rec",
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
+    text_det_limit_side_len=640,
+    text_recognition_batch_size=16,
+)
+
+
+
+
+
+import numpy as np
+
+def get_ocr_object_per_page(images,ocr,rec_res):
+  ocr_results =[]
+  ocr_results_per_page =[]
+
+  for i,image in enumerate(images):
+    detections = get_sorted_detections(rec_res[i])
+    if not detections:
+      return
+    for idx, det in enumerate(detections):
+      if det['name']=='table' or det['name']=='figure':
+        continue
+      else:
+        img_array = np.array(image)
+        cropped = crop_region(img_array, det["box"])
+        h, w = cropped.shape[:2]
+        cropped = cv2.resize(cropped, (int(w * 2.0), int(h * 2.0)), interpolation=cv2.INTER_CUBIC)
+
+        resultf = ocr.predict(cropped)
+        ocr_results_per_page.append(resultf)
+    ocr_results.append(ocr_results_per_page)
+    ocr_results_per_page=[]
+
+  return ocr_results
+
+# ocr_result = ocr.predict(images[0])
+
+## Serial Number EXTRACTION
+
+import re
+from serialnumbers import SerialNumber
+
+def find_classic_serials(text):
+    """
+    Extract classic serial numbers / catalog codes like:
+    PS51974822, 4CZL-9-LVR-UNV-L840-WLS4-CD-U, CIRRUS-SN
+    Context-aware and line-based.
+    """
+    context_phrases = [
+        "example:", "part number:", "figure:", "serial no:",
+        "ordering code:", "order code:", "ex:", "ordering logic   ex"
+    ]
+    context_patterns = [re.compile(r"sample\s+\w+\s+number", re.I)]
+
+    results = []
+    lines = text.splitlines()
+
+    for i, line in enumerate(lines):
+        lower_line = line.lower()
+        if any(p.search(lower_line) for p in context_patterns) or \
+           any(phrase.lower() in lower_line for phrase in context_phrases):
+
+            candidate_text = line
+            if i + 1 < len(lines):
+                candidate_text += " " + lines[i + 1]
+
+            # for match in re.finditer(r"[A-Za-z0-9\-]{3,}", candidate_text):
+            #     token = match.group()
+
+            #     # allow codes with digits OR at least 2 segments separated by '-'
+            #     if not (re.search(r"\d", token) or "-" in token):
+            #         continue
+            #     if len(token) < 4:
+            #         continue
+
+            #     try:
+            #         sn = SerialNumber.fromString(token)
+            #         results.append(sn.toString())
+            #     except ValueError:
+            #         # If SerialNumber rejects it, keep it if it looks like a hyphenated code
+            #         if "-" in token and token.isalnum() is False:
+            #             results.append(token)
+            # Change the regex to allow hyphens AND slashes
+            for match in re.finditer(r"[A-Za-z0-9\-/]{3,}", candidate_text):
+                token = match.group()
+
+                # Now accept tokens with digits, hyphens, OR slashes
+                if not (re.search(r"\d", token) or "-" in token or "/" in token):
+                    continue
+                if len(token) < 4:
+                    continue
+
+                try:
+                    sn = SerialNumber.fromString(token)
+                    results.append(sn.toString())
+                except ValueError:
+                    # Accept if it has - or /
+                    if ("-" in token or "/" in token) and not token.isalnum():
+                        results.append(token)
+    return results
+
+
+def find_space_separated_codes(text, min_segments=3):
+    """
+    Extract space-separated product codes (e.g. 'GSLF3 P30 40K MVOLT ASY QSM BK')
+    line-aware, requires context phrase nearby.
+    """
+    context_patterns = [
+        re.compile(r"sample\s+\w+\s+number", re.I),
+        re.compile(r"example:", re.I),
+    ]
+
+    results = []
+    lines = text.splitlines()
+    space_code_pattern = re.compile(r"(?:[A-Z0-9]{2,}\s+){2,}[A-Z0-9]{2,}", re.I)
+
+    for i, line in enumerate(lines):
+        lower_line = line.lower()
+
+        # If line has context phrase
+        if any(p.search(lower_line) for p in context_patterns):
+
+            # keep only the text AFTER the context keyword
+            for pat in context_patterns:
+                m = pat.search(lower_line)
+                if m:
+                    start = m.end()
+                    candidate_text = line[start:].strip()
+                    break
+            else:
+                candidate_text = line
+
+            # also check next line in case code is split
+            if i + 1 < len(lines):
+                candidate_text += " " + lines[i + 1]
+
+            # now run regex only on candidate portion
+            for match in space_code_pattern.finditer(candidate_text):
+                code = " ".join(match.group().split())
+                if len(code.split()) >= min_segments and "number" not in code.lower():
+                    results.append(code)
+
+    return results
+import numpy as np
+
+def join_ocr_texts(rec_texts, rec_polys, y_tolerance=12, x_tolerance=20, paragraph_gap=40):
+    """
+    Join OCR texts into structured text using both X and Y positions.
+
+    Args:
+        rec_texts (list[str]): recognized words.
+        rec_polys (list[list]): bounding boxes, each is list of 4 (x,y).
+        y_tolerance (int): max vertical difference for same line.
+        x_tolerance (int): min gap between words before inserting extra space.
+        paragraph_gap (int): vertical gap that creates blank line between paragraphs.
+
+    Returns:
+        str: reconstructed text with structure.
+    """
+    if not rec_texts or not rec_polys:
+        return ""
+
+    # collect word centers + bbox
+    words = []
+    for text, poly in zip(rec_texts, rec_polys):
+        if not text.strip():
+            continue
+        poly = np.array(poly)
+        x_min, y_min = poly[:,0].min(), poly[:,1].min()
+        x_max, y_max = poly[:,0].max(), poly[:,1].max()
+        cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+        words.append((text, cx, cy, x_min, x_max, y_min, y_max))
+
+    # sort top to bottom, then left to right
+    words.sort(key=lambda x: (x[2], x[1]))
+
+    lines = []
+    current_line = []
+    last_y = None
+
+    for word in words:
+        text, cx, cy, x_min, x_max, y_min, y_max = word
+
+        if last_y is None or abs(cy - last_y) <= y_tolerance:
+            current_line.append(word)
+            last_y = cy if last_y is None else (last_y + cy) / 2
+        else:
+            # flush current line
+            current_line.sort(key=lambda w: w[3])  # sort by left edge
+            line_str = current_line[0][0]
+            for i in range(1, len(current_line)):
+                prev = current_line[i-1]
+                cur = current_line[i]
+                # insert extra space if big horizontal gap
+                if cur[3] - prev[4] > x_tolerance:
+                    line_str += "   " + cur[0]
+                else:
+                    line_str += " " + cur[0]
+            lines.append((last_y, line_str))
+
+            # check for paragraph break
+            if cy - last_y > paragraph_gap:
+                lines.append((cy - 0.1, ""))  # blank line marker
+
+            current_line = [word]
+            last_y = cy
+
+    # flush last line
+    if current_line:
+        current_line.sort(key=lambda w: w[3])
+        line_str = current_line[0][0]
+        for i in range(1, len(current_line)):
+            prev = current_line[i-1]
+            cur = current_line[i]
+            if cur[3] - prev[4] > x_tolerance:
+                line_str += "   " + cur[0]
+            else:
+                line_str += " " + cur[0]
+        lines.append((last_y, line_str))
+
+    # return sorted by Y
+    return "\n".join(l for _, l in sorted(lines, key=lambda x: x[0]))
+
+
+
+## Serial Number Parsing
+
+from typing import List, Dict, Any, Tuple, Optional
+
+import re
+from typing import List
+
+def _split_serial(serial_no: str) -> List[str]:
+    # Split on multiple delimiters including spaces
+    parts = re.split(r'[-/._:|{}()\[\]\\\s]+', serial_no)
+    # Strip whitespace and filter out empty strings
+    return [p.strip() for p in parts if p.strip()]
+
+def parse_serial_components(serial_num):
+    """
+    Parse serial number into individual components.
+    Handles various delimiters intelligently.
+    """
+    # Common delimiters in serial numbers
+    delimiters = ['-', '_', '.', '/', '\\', ' ', ',']
+
+    # Start with the original serial number
+    components = [serial_num]
+
+    # Split by each delimiter
+    for delimiter in delimiters:
+        new_components = []
+        for comp in components:
+            if delimiter in comp:
+                # Split and keep non-empty parts
+                parts = [p.strip() for p in comp.split(delimiter) if p.strip()]
+                new_components.extend(parts)
+            else:
+                new_components.append(comp)
+        components = new_components
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_components = []
+    for comp in components:
+        if comp not in seen:
+            seen.add(comp)
+            unique_components.append(comp)
+
+    return unique_components
+
+
+def filter_components(components):
+    """
+    Filter components to reduce false positives.
+    Removes single characters and very common patterns.
+    """
+    filtered = []
+
+    for comp in components:
+        # Skip single characters (too many false positives)
+        if len(comp) <= 1:
+            continue
+
+        # Skip pure numbers less than 3 digits (too common)
+        if comp.isdigit() and len(comp) < 3:
+            continue
+
+        # Keep components that are:
+        # - Alphanumeric with length >= 3
+        # - Mixed alphanumeric (letters and numbers)
+        # - Pure letters with length >= 3
+        # - Pure numbers with length >= 3
+
+        has_letter = any(c.isalpha() for c in comp)
+        has_digit = any(c.isdigit() for c in comp)
+
+        # Prioritize mixed alphanumeric (most distinctive)
+        if has_letter and has_digit:
+            filtered.append(comp)
+        # Accept longer pure letter or number sequences
+        elif len(comp) >= 3:
+            filtered.append(comp)
+        # Accept 2-character sequences if they're not too common
+        elif len(comp) == 2 and comp.upper():
+            # You might want to be more selective here
+            filtered.append(comp)
+
+    return filtered
+
+
+## Page Identification
+
+import re
+
+def find_pages(ocr_results, serial_num):
+    """
+    Find pages containing serial number or its components.
+    Falls back to keyword search if nothing found.
+    """
+    pages = []
+
+    # First attempt: Search for full serial number
+    for idx, page_result in enumerate(ocr_results):
+        text = page_result[0]['rec_texts']
+        big_text = " ".join(text).lower()
+
+        # Search for full serial number (case-insensitive)
+        if serial_num.lower() in big_text:
+            pages.append(idx)
+
+    # Second attempt: If full serial not found, search for components
+    if not pages:
+        pages = search_serial_components(ocr_results, serial_num)
+
+    # Third attempt: If still no results, fall back to keyword search
+    if not pages:
+        keywords = ["order", "ordering", "logic", "guide", "product selector",
+                   "information", "specification"]
+        for idx, page_result in enumerate(ocr_results):
+            text = page_result[0]['rec_texts']
+            pattern = re.compile(r"(?:{})".format("|".join(re.escape(k) for k in keywords)),
+                               re.IGNORECASE)
+            big_text = " ".join(text).lower()
+            if bool(pattern.search(big_text)):
+                pages.append(idx)
+
+    return pages
+
+
+def search_serial_components(ocr_results, serial_num):
+    """
+    Search for individual components of a serial number with smart filtering
+    to reduce false positives.
+    """
+    pages = []
+
+    # Parse serial number into components
+    components = parse_serial_components(serial_num)
+
+    # Filter components to reduce false positives
+    filtered_components = filter_components(components)
+
+    if not filtered_components:
+        return pages
+
+    # Search for filtered components
+    for idx, page_result in enumerate(ocr_results):
+        text = page_result[0]['rec_texts']
+        big_text = " ".join(text).lower()
+
+        # Count how many significant components are found
+        matches_found = 0
+        total_significant = len(filtered_components)
+
+        for component in filtered_components:
+            # Use word boundaries for better matching
+            # This helps avoid partial matches within other words
+            pattern = r'\b' + re.escape(component.lower()) + r'\b'
+            if re.search(pattern, big_text):
+                matches_found += 1
+
+        # Require a minimum threshold of matches
+        # Adjust threshold based on number of components
+        if total_significant <= 3:
+            threshold = total_significant  # All must match if few components
+        elif total_significant <= 5:
+            threshold = total_significant - 1  # Allow one missing
+        else:
+            threshold = int(total_significant * 0.7)  # 70% must match
+
+        if matches_found >= threshold:
+            pages.append(idx)
+            # Optional: Store match confidence for ranking
+            # pages.append((idx, matches_found / total_significant))
+
+    return pages
+
+# Advanced version with confidence scoring
+def find_pages_with_confidence(ocr_results, serial_num):
+    """
+    Enhanced version that returns pages with confidence scores.
+    """
+    results = []
+
+    # First attempt: Full serial number (highest confidence)
+    for idx, page_result in enumerate(ocr_results):
+        text = page_result[0]['rec_texts']
+        big_text = " ".join(text).lower()
+
+        if serial_num.lower() in big_text:
+            results.append({'page': idx, 'confidence': 1.0, 'match_type': 'full'})
+
+    # If full match found, return immediately
+    if results:
+        return results
+
+    # Second attempt: Component matching
+    components = parse_serial_components(serial_num)
+    filtered_components = filter_components(components)
+
+    if filtered_components:
+        for idx, page_result in enumerate(ocr_results):
+            text = page_result[0]['rec_texts']
+            big_text = " ".join(text).lower()
+
+            matches_found = 0
+            matched_components = []
+
+            for component in filtered_components:
+                pattern = r'\b' + re.escape(component.lower()) + r'\b'
+                if re.search(pattern, big_text):
+                    matches_found += 1
+                    matched_components.append(component)
+
+            if matches_found > 0:
+                confidence = matches_found / len(filtered_components)
+
+                # Only include if confidence is above threshold
+                if confidence >= 0.5:  # 50% minimum
+                    results.append({
+                        'page': idx,
+                        'confidence': confidence,
+                        'match_type': 'components',
+                        'matched': matched_components
+                    })
+
+    # Sort by confidence
+    results.sort(key=lambda x: x['confidence'], reverse=True)
+
+    # If still no results, fall back to keyword search (low confidence)
+    if not results:
+        keywords = ["order", "ordering", "logic", "guide", "product selector",
+                   "information", "specification"]
+        for idx, page_result in enumerate(ocr_results):
+            text = page_result[0]['rec_texts']
+            big_text = " ".join(text).lower()
+
+            keyword_matches = sum(1 for k in keywords if k in big_text)
+            if keyword_matches > 0:
+                results.append({
+                    'page': idx,
+                    'confidence': 0.3 * (keyword_matches / len(keywords)),
+                    'match_type': 'keywords'
+                })
+
+    return results
+
+
+## Table Processing Pipeline
+
+from PIL import Image
+from numpy import asarray
+from surya.table_rec import TableRecPredictor
+
+def get_table_predictions(table_image):
+  table_rec_predictor = TableRecPredictor()
+  table_predictions = table_rec_predictor([table_image])
+  return table_predictions
+
+
+def col_crops(image, coL_list, by_col, padding=1, gain=1.02):
+    """
+    Crops the image using bounding boxes adjusted by padding and gain.
+    """
+    cropped = []
+    coords = []
+    upscale = 2
+    if by_col:
+        for idx, (bbox, col_id) in enumerate(coL_list):
+            x_min, y_min, x_max, y_max = map(int, bbox)
+
+            # Step 1: Apply padding
+            x_min_pad = x_min - padding
+            y_min_pad = y_min - padding
+            x_max_pad = x_max + padding
+            y_max_pad = y_max + padding
+
+            # Step 2: Apply gain scaling
+            width = x_max_pad - x_min_pad
+            height = y_max_pad - y_min_pad
+
+            center_x = (x_min_pad + x_max_pad) / 2
+            center_y = (y_min_pad + y_max_pad) / 2
+
+            new_width = width * gain
+            new_height = height * gain
+
+            # Step 3: Compute adjusted coordinates
+            x_min_adj = int(round(center_x - new_width / 2))
+            x_max_adj = int(round(center_x + new_width / 2))
+            y_min_adj = int(round(center_y - new_height / 2))
+            y_max_adj = int(round(center_y + new_height / 2))
+
+            # Step 4: Crop the image using adjusted coordinates
+            im1 = image.crop((x_min_adj, y_min_adj, x_max_adj, y_max_adj))
+            im = im1.resize((im1.width * upscale, im1.height * upscale), Image.LANCZOS)
+
+            coords.append((x_min_adj*upscale, y_min_adj*upscale, x_max_adj*upscale, y_max_adj*upscale))
+
+            cropped.append(asarray(im))
+        return cropped ,coords
+    else:
+        for col in coL_list:
+            x_min, y_min, x_max, y_max = map(int, col.bbox)
+
+            # Step 1: Apply padding
+            x_min_pad = x_min - padding
+            y_min_pad = y_min - padding
+            x_max_pad = x_max + padding
+            y_max_pad = y_max + padding
+
+            # Step 2: Apply gain scaling
+            width = x_max_pad - x_min_pad
+            height = y_max_pad - y_min_pad
+
+            center_x = (x_min_pad + x_max_pad) / 2
+            center_y = (y_min_pad + y_max_pad) / 2
+
+            new_width = width * gain
+            new_height = height * gain
+
+            # Step 3: Compute adjusted coordinates
+            x_min_adj = int(round(center_x - new_width / 2))
+            x_max_adj = int(round(center_x + new_width / 2))
+            y_min_adj = int(round(center_y - new_height / 2))
+            y_max_adj = int(round(center_y + new_height / 2))
+
+            # Step 4: Crop the image using adjusted coordinates
+            im1 = image.crop((x_min_adj, y_min_adj, x_max_adj, y_max_adj))
+            im = im1.resize((im1.width * 2, im1.height * 2), Image.LANCZOS)
+            coords.append((x_min_adj*upscale, y_min_adj*upscale, x_max_adj*upscale, y_max_adj*upscale))
+
+            cropped.append(asarray(im))
+        return cropped ,coords
+
+
+
+
+
+
+def process_table_image(image,ocr):
+    """
+    Main function to process a table image, extract headers, and save them.
+    """
+    img = Image.fromarray(image)
+    # im = upscale_and_center_image(img)
+    im = img.resize((img.width *2 , img.height * 2), Image.LANCZOS) # LANCZOS for high-quality downsampling/upsampling
+    # im = img
+    table_predictions = get_table_predictions(im)
+    columns,by_col = get_col_region(table_predictions, ocr, im)
+
+    col_crop,coords = col_crops(im, columns, by_col)
+
+    return col_crop,coords
+
+def get_header_row_id(cells,ocr,image):
+  val = -1
+  # print(cells)
+  for idx, cell in enumerate(cells):
+    if val == cell.row_id:
+      continue
+    else:
+      # print(idx)
+      x_min, y_min, x_max, y_max = map(int, cell.bbox)
+      im1 = image.crop((x_min, y_min, x_max, y_max))
+      try:
+        x_min, y_min, x_max, y_max = map(int, cells[idx+1].bbox)
+        im2 = image.crop((x_min, y_min, x_max, y_max))
+        text2 = ocr.predict(asarray(im2))[0]['rec_texts']
+      except:
+          text2 =[None]
+
+      res = ocr.predict(asarray(im1))
+      print(res)
+      text = res[0]['rec_texts']
+      if text is not None:
+        # print(cell.row_id)
+        return cell.row_id
+      if text2[0] is not None:
+        # print(cell.row_id)
+        return cell.row_id
+      else:
+        val = cell.row_id
+
+def extend_cell_to_image_end(cell, image_height):
+    # Update polygon
+    cell.polygon[2][1] = image_height  # top-right y-coordinate
+    cell.polygon[3][1] = image_height  # bottom-right yffffffffffffffffff-coordinate
+
+    # Update bounding box
+    cell.bbox[3] = image_height  # max y-coordinate
+
+    return cell
+
+def get_col_region(table_predictions,ocr,image):
+  image_height = image.height
+  cells = table_predictions[0].cells
+  col_list = []
+  # row_one = []
+  header_row_id = get_header_row_id(cells,ocr,image)
+  # Collect header cells
+  header_cells = [cell for cell in cells if cell.row_id == header_row_id]
+  # Check if any cell has colspan > 3
+  has_large_colspan = any(cell.colspan > 3 for cell in header_cells)
+  if has_large_colspan:
+    columns = table_predictions[0].cols
+    col_list = extract_header_regions(columns)
+    by_col = True
+  else:
+    by_col = False
+    for cell in cells:
+      if cell.row_id == header_row_id:
+        col = extend_cell_to_image_end(cell, image_height)
+        col_list.append(col)
+  return col_list, by_col
+
+def extract_header_regions(columns):
+    final_crops = []
+    i = 0
+    # columns = table_predictions[0].cols
+    while i < len(columns):
+      if not (i+1)>=len(columns):
+        if columns[i].is_header == True and columns[i + 1].is_header ==False:
+              # Merge current and next column
+              col1 = columns[i]
+              col2 = columns[i + 1]
+
+              merged_bbox = [
+                  col1.bbox[0],  # x1 of first column
+                  min(col1.bbox[1], col2.bbox[1]),  # min y1
+                  col2.bbox[2],  # x2 of second column
+                  max(col1.bbox[3], col2.bbox[3])   # max y2
+              ]
+
+              # Use the first column's col_id for naming
+              final_crops.append((merged_bbox, col1.col_id))
+              i += 2  # Skip both columns
+        elif columns[i].is_header == False and columns[i + 1].is_header ==False:
+              col1 = columns[i]
+              col2 = columns[i + 1]
+              final_crops.append((col1.bbox, col1.col_id))
+              final_crops.append((col2.bbox, col2.col_id))
+              i += 2  # Skip both columns
+        else:
+              final_crops.append((columns[i].bbox, columns[i].col_id))
+              i += 1
+      else:
+          col1 = columns[i]
+          final_crops.append((col1.bbox, col1.col_id))
+          i+=1
+    return final_crops
+
+
+import cv2
+import torch
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+from doclayout_yolo.utils.ops import xyxy2xywh, xywh2xyxy, clip_boxes
+
+def crop_region(img_array, box, gain=1.01, pad=2):
+    """
+    Crops a region from a numpy image array given a bounding box.
+    Allows optional expansion via gain/pad and conversion to square.
+
+    Args:
+        img_array (np.ndarray): The input image as a NumPy array (H, W, C).
+        box (dict or list or torch.Tensor): Bounding box in [x1, y1, x2, y2] format.
+        gain (float): Multiplier to expand the box size.
+        pad (int): Additional pixels to add to width/height.
+    Returns:
+        np.ndarray: The cropped image.
+    """
+    # Convert box to tensor if needed
+    if not isinstance(box, torch.Tensor):
+        if isinstance(box, dict):
+            x1, y1, x2, y2 = map(int, [box["x1"], box["y1"], box["x2"], box["y2"]])
+        else:
+            x1, y1, x2, y2 = map(int, box)
+        box = torch.tensor([[x1, y1, (x2), y2]])
+
+    # Convert xyxy -> xywh
+    b = xyxy2xywh(box.view(-1, 4))
+
+    # Apply gain and padding
+    b[:, 2:] = b[:, 2:] * gain + pad
+
+    # Back to xyxy
+    xyxy = xywh2xyxy(b).long()
+
+    # Clip coordinates to image bounds
+    xyxy = clip_boxes(xyxy, img_array.shape)
+
+    # Crop image
+    crop = img_array[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2])]
+    # Add black line at the top
+    crop[0, :] = 0
+
+    # crop.save(f"header_section.png")
+    return crop
+
+
+from dataclasses import dataclass, field
+from typing import List, Tuple
+import numpy as np
+
+@dataclass
+class TableColumn:
+    bbox: List[Tuple[int, int, int, int]]                 # (x1, y1, x2, y2) column bounding box
+    image: np.ndarray                               # cropped column image
+    texts: List[str]   # OCR recognized strings
+    boxes: np.ndarray
+    # OCR bounding boxes per recognized text (aligned with `texts`)
+
+
+@dataclass
+class DetectedTable:
+    page_index: int                                 # which page this table came from
+    table_bbox: dict                               # full table bounding box {'x1':'332, 'y1':0, 'x2':'0, 'y2':4 }
+    table_image: np.ndarray                         # cropped table image
+    columns: List[TableColumn] = field(default_factory=list)
+
+    @property
+    def num_columns(self) -> int:
+        return len(self.columns)
+
+
+
+## Basic Matching
+
+import re
+from typing import List, Dict, Any
+from collections import deque
+def flatten(xss):
+    return [x for xs in xss for x in xs]
+def correct_ocr_text(text):
+    # Only fix likely OCR mistakes: letters → digits
+    return text.translate(str.maketrans({
+        'o': '0',
+        'O': '0',
+        # 'l': '1',
+        # '1': 'l',
+        # 'I': '1',   # if your OCR confuses capital I with 1
+        # 'i': '1', # optional, but often overcorrection
+    }))
+
+
+def exact_match_in_tables(tables: List, serial_no: str):
+    found = []
+    new_splits = []
+    total_col_count = 0
+    new = []
+    # keep all parts in order
+    parts = _split_serial(serial_no)
+    # use casefold lookup but preserve duplicates/order in deque
+    parts_lookup = deque(parts)
+    # print(parts_lookup)
+    for i, part in enumerate(parts_lookup):
+      if any(c in part for c in 'o0O'):  # include uppercase if needed
+          corrected_part = correct_ocr_text(part)
+          new.append(corrected_part)
+    for n in new:
+      parts_lookup.append(n)
+
+    pages: Dict[int, Dict[str, Any]] = {}
+    big_text = ""  # start empty before loop
+    for table in tables:
+        col_count = 0
+        page_idx = table.page_index
+        if page_idx not in pages:
+            pages[page_idx] = {"page_index": page_idx, "tables": []}
+
+        table_hits = []
+        for col_idx, col in enumerate(table.columns):
+            big_text += " " + " ".join(col.texts).lower()
+            for word_idx, word in enumerate(col.texts):
+                cleaned = re.sub(r'[^a-zA-Z0-9_=/-]', ' ', word)
+                tokens = cleaned.split('=')
+
+                word_bbox = col.boxes[word_idx]
+
+                for token in tokens:
+                    key = token.strip().casefold()
+                    # check if next expected part matches
+                    for i, part in enumerate(parts_lookup):
+                        # print(part,type(part))
+                        # print(key,type(key))
+                        if key == part.strip().casefold():
+                            # print(key, part)
+                            original_part = part
+                            found.append(token)
+                            # remove this part so it can’t match again
+                            parts_lookup.remove(part)
+                            if not col_count:
+                              col_count = table.num_columns
+                              # print(col_count)
+
+                            table_hits.append({
+                                'tableclass': table,
+                                "page_index": table.page_index,
+                                "table_bbox": table.table_bbox,
+                                "column_index": col_idx,
+                                "column_bbox": getattr(col, "bbox", None),
+                                "matched_text": token,
+                                "term": original_part,
+                                "word_bbox": word_bbox,
+                            })
+                            break  # stop checking this token once matched
+
+        pages[page_idx]["tables"].append({"table": table, "hits": table_hits})
+        total_col_count = total_col_count + col_count
+
+
+    not_found = list(parts_lookup)
+    # print(not_found)
+    # Fallback: look for not_found parts as substrings in full cell texts
+    if not_found:
+        substring_hits, substring_found, not_found = find_substring_matches_in_tables(tables, not_found)
+        # Add these hits to your all_hits structure
+        # Group by page like you do elsewhere
+        for hit in substring_hits:
+            page_idx = hit["page_index"]
+            if page_idx not in pages:
+                pages[page_idx] = {"page_index": page_idx, "tables": []}
+
+            # Find or create table entry in pages[page_idx]["tables"]
+            table_found = False
+            for tbl_entry in pages[page_idx]["tables"]:
+                if tbl_entry["table"] is hit["tableclass"]:
+                    tbl_entry["hits"].append(hit)
+                    table_found = True
+                    break
+            if not table_found:
+                pages[page_idx]["tables"].append({"table": hit["tableclass"], "hits": [hit]})
+
+        found.extend(substring_found)
+    all_hits = list(pages.values())
+
+    # print(big_text)
+
+
+    all_hits, found, not_found = find_combined_parts_in_tables(all_hits,found, not_found)
+
+    for serial in not_found:
+        new_split = greedy_backward_split(serial,big_text)
+        new_splits.append(new_split)
+
+    new_splits = flatten(new_splits)
+    all_hits, found, not_found = find_new_splits_in_tables(all_hits,found, not_found, new_splits)
+
+    all_hits, found, not_found = find_empty_and_placeholder_columns({p.casefold(): p for p in parts}, all_hits, found, total_col_count, not_found)
+    all_hits, found, not_found = strip_trailing_then_search(all_hits,found, not_found)
+
+    return found, all_hits, not_found
+
+
+def find_substring_matches_in_tables(tables: List, not_found_parts: List[str]):
+    hits = []
+    found_parts = []
+
+    # Normalize not_found_parts for case-insensitive matching
+    not_found_norm = {part.casefold(): part for part in not_found_parts}
+
+    for table in tables:
+        for col_idx, col in enumerate(table.columns):
+            for word_idx, word in enumerate(col.texts):
+                word_lower = word.lower()
+                word_bbox = col.boxes[word_idx]
+                word_lower = re.sub(r'[^a-zA-Z0-9_=/ -]', '', word_lower)
+                word_lower = word_lower.lstrip()
+                # print(word_lower)
+                # Check each not-found part
+                for norm_part, original_part in not_found_norm.items():
+                    if norm_part in word_lower and word_lower.startswith(norm_part):
+                        # Avoid double-matching same part
+                        # print(word_lower)
+                        if original_part in found_parts:
+                            continue
+
+                        hits.append({
+                            'tableclass': table,
+                            "page_index": table.page_index,
+                            "table_bbox": table.table_bbox,
+                            "column_index": col_idx,
+                            "column_bbox": getattr(col, "bbox", None),
+                            "matched_text": word,  # full cell text
+                            "term": original_part,  # the part we were looking for
+                            "word_bbox": word_bbox,
+                        })
+                        found_parts.append(original_part)
+
+    # Remove found parts from not_found
+    remaining_not_found = [p for p in not_found_parts if p not in found_parts]
+    return hits, found_parts, remaining_not_found
+
+
+import re
+
+def greedy_backward_split(serial: str, ocr_text: str):
+    """
+    Split serial into segments that appear as FULL WORDS in OCR text.
+
+    Matching rules:
+    - Only exact full-word matches count (e.g., 'G' matches only if OCR contains 'G' as a word)
+
+    Fallback strategy:
+    1. Greedily match longest prefix that is a full OCR word.
+    2. If no prefix matches, try splitting remainder into single characters —
+       but ONLY if every character exists as a full word in OCR.
+    3. If even that fails, append the entire unmatched substring as-is.
+    """
+    # Normalize OCR text
+    ocr_upper = ocr_text.upper()
+
+    # Split key=value patterns into separate tokens (e.g., "RA=REGRESSED" → "RA REGRESSED")
+    ocr_processed = re.sub(r"([A-Z0-9/\-]+)=([A-Z0-9/\-]+)", r"\1 \2", ocr_upper)
+
+    # Remove disallowed characters, replace with space
+    cleaned_ocr = re.sub(r"[^A-Z0-9/\-\s]", " ", ocr_processed)
+
+    # Normalize whitespace to avoid empty tokens
+    cleaned_ocr = ' '.join(cleaned_ocr.split())
+
+    # Extract full words only
+    ocr_words = set(word for word in cleaned_ocr.split() if word)
+
+    # Clean serial (keep only allowed chars)
+    serial_clean = re.sub(r"[^A-Z0-9/\-]", "", serial.upper().strip())
+    segments = []
+
+    def split_recursive(s: str):
+        if not s:
+            return
+
+        # ✅ Try longest prefix that is a FULL WORD in OCR
+        for j in range(len(s), 0, -1):
+            candidate = s[:j]
+            if candidate in ocr_words:
+                # print('candidate',candidate)
+                # print(ocr_words)
+                segments.append(candidate)
+                split_recursive(s[j:])
+                return
+
+        # Fallback: try single-character split (only if all chars are valid words)
+        if len(s) > 1:
+            if all(char in ocr_words for char in s):
+                segments.extend(list(s))
+                return
+
+        # Final fallback: keep as-is
+        segments.append(s)
+
+    split_recursive(serial_clean)
+    return segments
+
+from typing import Dict, List, Tuple, Any
+import re
+
+def find_empty_and_placeholder_columns(
+    parts_lookup: Dict[str, str],
+    all_hits: List[Dict[str, Any]],
+    found: List[str],
+    col_count: int,
+    not_found: List[str] = None
+) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """
+    Works on page → tables → hits structure.
+
+    Rules:
+      - "blank" is always accepted as a placeholder hit.
+      - "xx" is only accepted if not_found contains exactly one numeric-only value.
+        In that case, that numeric is consumed and marked as found.
+      - If no numeric-only part exists, "xx" does NOT count as a hit.
+    """
+    updated_found = found.copy()
+    updated_all_hits = []
+    updated_not_found = not_found.copy() if not_found else []
+
+    serial_parts_length = len(found)
+    found_count = col_count
+
+    # already complete, nothing to do
+    if serial_parts_length == found_count:
+        return all_hits, updated_found, updated_not_found
+
+    # check if not_found has exactly one numeric-only entry
+    numeric_only = [nf for nf in updated_not_found if nf.isdigit()]
+    numeric_to_use = numeric_only[0] if len(numeric_only) == 1 else None
+
+    for page_result in all_hits:
+        page_idx = page_result["page_index"]
+        updated_tables = []
+
+        for table_result in page_result["tables"]:
+            table = table_result["table"]
+            table_hits = table_result["hits"].copy()
+
+            if not table or not hasattr(table, "columns"):
+                updated_tables.append({"table": table, "hits": table_hits})
+                continue
+
+            col_count = len(table.columns) if hasattr(table.columns, "__len__") else 0
+            hit_column_indices = [hit["column_index"] for hit in table_hits if "column_index" in hit]
+
+            for col_idx in range(col_count):
+                if col_idx not in hit_column_indices:
+                    column = table.columns[col_idx]
+                    texts = getattr(column, "texts", []) or []
+                    boxes = getattr(column, "boxes", [])
+
+                    for word_idx, word in enumerate(texts):
+                        if not word:
+                            continue
+
+                        word_lower = re.sub(r'[^a-zA-Z0-9=/-]', '', word.casefold())
+                        # print(word_lower)
+                        # if word_lower.startswith("blank"):
+                        if re.match(r'^.?blank.?', word_lower):
+                            # always accept "blank"
+                            if word not in updated_found:
+                                updated_found.append(word)
+
+                            table_hits.append({
+                                "page_index": page_idx,
+                                "table_bbox": table.table_bbox,
+                                "column_index": col_idx,
+                                "column_bbox": getattr(column, "bbox", None),
+                                "matched_text": word,
+                                "term": '',
+                                "word_bbox": boxes[word_idx] if word_idx < len(boxes) else None,
+                            })
+
+                        elif "xx" in word_lower and numeric_to_use:
+                            # accept "xx" only if numeric candidate exists
+                            if word not in updated_found:
+                                updated_found.append(word)
+                            updated_found.append(numeric_to_use)
+                            updated_not_found.remove(numeric_to_use)
+                            numeric_to_use = None  # consume once
+
+                            table_hits.append({
+                                "page_index": page_idx,
+                                "table_bbox": table.table_bbox,
+                                "column_index": col_idx,
+                                "column_bbox": getattr(column, "bbox", None),
+                                "matched_text": word,
+                                "term": '',
+                                "word_bbox": boxes[word_idx] if word_idx < len(boxes) else None,
+                            })
+
+            updated_tables.append({"table": table, "hits": table_hits})
+
+        updated_all_hits.append({"page_index": page_idx, "tables": updated_tables})
+
+    return updated_all_hits, updated_found, updated_not_found
+
+
+from typing import Dict, List, Any, Tuple
+import re
+
+def find_combined_parts_in_tables(
+    all_hits: List[Dict[str, Any]],
+    found: List[str],
+    not_found: List[str]
+) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """
+    Attempts to match concatenated parts from not_found inside tables.
+    If found, adds to found & all_hits, and removes from not_found (parts + combo).
+    """
+    updated_found = found.copy()
+    updated_not_found = not_found.copy()
+    updated_all_hits = []
+
+    # Generate all possible concatenations (2+ parts)
+    combos = []
+    for i in range(len(not_found)):
+        for j in range(i + 2, len(not_found) + 1):
+            parts = not_found[i:j]
+            combo_hyphen = "-".join(parts)
+            combo_slash = "/".join(parts)
+            combos.append((combo_hyphen, parts))
+            combos.append((combo_slash, parts))
+
+    # Search inside all pages/tables/columns
+    for page_result in all_hits:
+        page_idx = page_result["page_index"]
+        updated_tables = []
+
+        for table_result in page_result["tables"]:
+            table = table_result["table"]
+            table_hits = table_result["hits"].copy()
+
+            if not table or not hasattr(table, 'columns'):
+                updated_tables.append({"table": table, "hits": table_hits})
+                continue
+
+            for col_idx, col in enumerate(table.columns):
+                texts = getattr(col, "texts", []) or []
+                boxes = getattr(col, "boxes", [])
+
+                for word_idx, word in enumerate(texts):
+                    cleaned = re.sub(r'[^a-zA-Z0-9=/-]', '', word).casefold()
+
+                    for combo, parts in combos:
+                        if combo.casefold() in cleaned and cleaned.startswith(combo.casefold()):
+                            if combo not in updated_found:
+                                updated_found.append(combo)
+
+                                # remove matched parts from not_found
+                                for p in parts:
+                                    if p in updated_not_found:
+                                        updated_not_found.remove(p)
+
+                                # also remove the full combo if present
+                                if combo in updated_not_found:
+                                    updated_not_found.remove(combo)
+
+                            table_hits.append({
+                                "page_index": page_idx,
+                                "table_bbox": table.table_bbox,
+                                "column_index": col_idx,
+                                "column_bbox": getattr(col, "bbox", None),
+                                "matched_text": word,
+                                "term": combo,
+                                "word_bbox": boxes[word_idx] if word_idx < len(boxes) else None,
+                            })
+
+            updated_tables.append({"table": table, "hits": table_hits})
+
+        updated_all_hits.append({"page_index": page_idx, "tables": updated_tables})
+
+    return updated_all_hits, updated_found, updated_not_found
+
+
+from typing import Dict, List, Any, Tuple
+import re
+
+def strip_trailing_then_search(
+    all_hits: List[Dict[str, Any]],
+    found: List[str],
+    not_found: List[str]
+) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """
+    Strips trailing digits from not_found parts and OCR text,
+    then attempts matches inside tables.
+    If found, adds to found & all_hits, and removes from not_found.
+    """
+    updated_found = found.copy()
+    updated_not_found = not_found.copy()
+    updated_all_hits = []
+
+    def strip_trailing_digits(s: str) -> str:
+        return re.sub(r"\d+$", "", s)
+
+    # Prepare stripped versions of not_found
+    stripped_map = {nf: strip_trailing_digits(nf) for nf in not_found}
+
+    for page_result in all_hits:
+        page_idx = page_result["page_index"]
+        updated_tables = []
+
+        for table_result in page_result["tables"]:
+            table = table_result["table"]
+            table_hits = table_result["hits"].copy()
+
+            if not table or not hasattr(table, "columns"):
+                updated_tables.append({"table": table, "hits": table_hits})
+                continue
+
+            for col_idx, col in enumerate(table.columns):
+                texts = getattr(col, "texts", []) or []
+                boxes = getattr(col, "boxes", [])
+
+                for word_idx, word in enumerate(texts):
+                    if not word:
+                        continue
+
+                    cleaned = re.sub(r"[^a-zA-Z0-9=/ -]", "", word)
+                    cleaned_stripped = strip_trailing_digits(cleaned).casefold()
+                    cleaned_stripped = cleaned_stripped.lstrip()
+                    # compare against stripped not_found values
+                    # Extract the first word from the cleaned OCR text
+                    first_word = cleaned_stripped.split()[0] if cleaned_stripped.split() else ""
+
+                    # Compare against stripped not_found values
+                    for original_nf, stripped_nf in stripped_map.items():
+                        stripped_nf_lower = stripped_nf.casefold().strip()
+                        if not stripped_nf_lower:
+                            continue
+
+                        # Check if the FIRST WORD of OCR text starts with the stripped search term
+                        if first_word.startswith(stripped_nf_lower):
+                            if original_nf not in updated_found:
+                                updated_found.append(original_nf)
+                                if original_nf in updated_not_found:
+                                    updated_not_found.remove(original_nf)
+
+                            table_hits.append({
+                                "page_index": page_idx,
+                                "table_bbox": table.table_bbox,
+                                "column_index": col_idx,
+                                "column_bbox": getattr(col, "bbox", None),
+                                "matched_text": word,
+                                "term": original_nf,
+                                "word_bbox": boxes[word_idx] if word_idx < len(boxes) else None,
+                            })
+
+            updated_tables.append({"table": table, "hits": table_hits})
+
+        updated_all_hits.append({"page_index": page_idx, "tables": updated_tables})
+    # print('remaining_not_found',updated_not_found)
+
+    return updated_all_hits, updated_found, updated_not_found
+
+
+def find_reconstructable_codes(found_parts: list[str], original_codes: list[str]) -> list[str]:
+    word_set = set(part.strip().casefold() for part in found_parts)
+    result = []
+    for code in original_codes:
+        s = code.strip().casefold()
+        n = len(s)
+        dp = [False] * (n + 1)
+        dp[0] = True
+        for i in range(1, n + 1):
+            for j in range(i):
+                if dp[j] and s[j:i] in word_set:
+                    dp[i] = True
+                    break
+        if dp[n]:
+            result.append(code)
+    return result
+
+def find_new_splits_in_tables(
+    all_hits: List[Dict[str, Any]],
+    found: List[str],
+    not_found: List[str],
+    new_splits: List[str]
+) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """
+    Searches directly for new_splits inside tables.
+    If found, adds to found & all_hits, removes from not_found.
+    """
+
+    updated_found = found.copy()
+    updated_not_found = not_found.copy()
+    updated_all_hits = []
+    # print('new_splits',new_splits)
+    combos = [(split, [split]) for split in new_splits]
+
+    for page_result in all_hits:
+        found_splits = []
+        page_idx = page_result["page_index"]
+        updated_tables = []
+
+        for table_result in page_result["tables"]:
+            table = table_result["table"]
+            table_hits = table_result["hits"].copy()
+
+            if not table or not hasattr(table, 'columns'):
+                updated_tables.append({"table": table, "hits": table_hits})
+                continue
+
+            for col_idx, col in enumerate(table.columns):
+                texts = getattr(col, "texts", []) or []
+                boxes = getattr(col, "boxes", [])
+
+                word_idx = 0
+                while word_idx < len(texts):
+                    word = texts[word_idx]
+                    cleaned = re.sub(r'[^a-zA-Z0-9=/() -]', '', word).casefold()
+
+                    for combo, parts in combos[:]:
+                        # print(combo,parts)
+                        # pattern = r'\b' + re.escape(combo.casefold()) + r'\b'
+                        pattern = r'^' + re.escape(combo.casefold()) + r'\b'
+                        cleaned = cleaned.lstrip()
+
+                        if re.search(pattern, cleaned):
+                            print(pattern, cleaned)
+                            if combo not in updated_found:
+
+                                updated_found.append(combo)
+                                for p in parts:
+                                    found_splits.append(p)
+                                    if p in updated_not_found:
+                                        updated_not_found.remove(p)
+
+                            table_hits.append({
+                                "page_index": page_idx,
+                                "table_bbox": table.table_bbox,
+                                "column_index": col_idx,
+                                "column_bbox": getattr(col, "bbox", None),
+                                "matched_text": word,
+                                "term": combo,
+                                "word_bbox": boxes[word_idx] if word_idx < len(boxes) else None,
+                            })
+
+                            combos.remove((combo, parts))
+
+                    word_idx += 1
+
+            updated_tables.append({"table": table, "hits": table_hits})
+
+        updated_all_hits.append({"page_index": page_idx, "tables": updated_tables})
+        result = find_reconstructable_codes(found_splits,updated_not_found)
+        if result:
+          # Find common items
+          common_items = set(updated_not_found) & set(result)
+          # Remove common items from both lists
+          updated_not_found = [item for item in updated_not_found if item not in result]
+
+    return updated_all_hits, updated_found, updated_not_found
+
+
+import numpy as np
+from collections import defaultdict
+
+# ---------- PARAMETERS ----------
+V_OVERLAP_THRESH = 0.5
+H_GAP_MULT = 1.5
+PARA_GAP_MULT = 1.5
+INDENT_THRESH = 30
+LINE_INDENT_THRESH = 20
+X_GAP_MULT = 0.8  # for column clustering
+CELL_GAP_MULT = 0.5  # for splitting wide lines into cells
+# --------------------------------
+
+def boxes_from_rec(rec_boxes):
+    boxes = []
+    for b in rec_boxes:
+        b = np.asarray(b).astype(float)
+        if b.size == 4:
+            xmin, ymin, xmax, ymax = b
+        elif b.size == 8:
+            xs = b[0::2]; ys = b[1::2]
+            xmin, ymin, xmax, ymax = xs.min(), ys.min(), xs.max(), ys.max()
+        else:
+            raise ValueError(f"rec_boxes element has unexpected length: {b.size}")
+        boxes.append([xmin, ymin, xmax, ymax])
+    return np.array(boxes)
+
+# # ---------- Column clustering ----------
+# def cluster_tokens_by_x(boxes, tokens, x_gap_mult=X_GAP_MULT):
+#     widths = boxes[:,2] - boxes[:,0]
+#     median_width = np.median(widths) if len(widths) > 0 else 1.0
+#     gap_thresh = median_width * x_gap_mult
+
+#     sorted_idx = np.argsort(boxes[:,0])
+#     columns = []
+#     cur_col = [sorted_idx[0]]
+
+#     for idx in sorted_idx[1:]:
+#         prev_idx = cur_col[-1]
+#         gap = boxes[idx,0] - boxes[prev_idx,2]
+#         if gap > gap_thresh:
+#             columns.append(cur_col)
+#             cur_col = [idx]
+#         else:
+#             cur_col.append(idx)
+#     columns.append(cur_col)
+
+#     token_columns = []
+#     for col in columns:
+#         token_columns.append([tokens[i] for i in col])
+#     return token_columns, columns
+
+import numpy as np
+
+# ---------- Column clustering ----------
+def cluster_tokens_by_x(boxes, tokens, x_gap_mult=X_GAP_MULT):
+    # Convert to numpy array
+    boxes = np.array(boxes, dtype=float)
+
+    # Handle empty boxes
+    if boxes.size == 0:
+        return [], []
+
+    # Ensure 2D shape (n,4)
+    if boxes.ndim == 1:
+        if boxes.size % 4 != 0:
+            raise ValueError(f"Unexpected boxes shape {boxes.shape}, expected multiple of 4 values")
+        boxes = boxes.reshape(-1, 4)
+
+    widths = boxes[:, 2] - boxes[:, 0]
+    median_width = np.median(widths) if len(widths) > 0 else 1.0
+    gap_thresh = median_width * x_gap_mult
+
+    # Sort left-to-right
+    sorted_idx = np.argsort(boxes[:, 0])
+    columns = []
+    cur_col = [sorted_idx[0]]
+
+    for idx in sorted_idx[1:]:
+        prev_idx = cur_col[-1]
+        gap = boxes[idx, 0] - boxes[prev_idx, 2]
+        if gap > gap_thresh:
+            columns.append(cur_col)
+            cur_col = [idx]
+        else:
+            cur_col.append(idx)
+    columns.append(cur_col)
+
+    # Assign tokens to columns
+    token_columns = [[tokens[i] for i in col] for col in columns]
+
+    return token_columns, columns
+
+
+# ---------- Vertical grouping ----------
+def union_find_groups(boxes, v_overlap_thresh=V_OVERLAP_THRESH):
+    n = len(boxes)
+    parent = list(range(n))
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    def union(a,b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    ymin = boxes[:,1]; ymax = boxes[:,3]; heights = ymax - ymin
+    for i in range(n):
+        for j in range(i+1, n):
+            overlap = min(ymax[i], ymax[j]) - max(ymin[i], ymin[j])
+            if overlap <= 0: continue
+            min_h = min(heights[i], heights[j])
+            if (overlap / (min_h + 1e-9)) >= v_overlap_thresh:
+                union(i,j)
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+    return list(groups.values())
+
+def split_group_into_lines(group_indices, boxes, median_width):
+    idx_sorted = sorted(group_indices, key=lambda i: boxes[i,0])
+    gap_thresh = max(median_width * H_GAP_MULT, 10)
+    lines, cur = [], [idx_sorted[0]]
+    for idx in idx_sorted[1:]:
+        prev = cur[-1]
+        gap = boxes[idx,0] - boxes[prev,2]
+        if gap > gap_thresh:
+            lines.append(cur); cur = [idx]
+        else:
+            cur.append(idx)
+    lines.append(cur)
+    return lines
+
+def compute_line_bbox(indices, boxes):
+    xs_min = boxes[indices,0].min()
+    ys_min = boxes[indices,1].min()
+    xs_max = boxes[indices,2].max()
+    ys_max = boxes[indices,3].max()
+    return [xs_min, ys_min, xs_max, ys_max]
+
+# ---------- Lines per column ----------
+def lines_from_boxes_by_column(boxes, col_indices):
+    median_width = np.median((boxes[:,2]-boxes[:,0]) + 1e-9)
+    col_boxes = boxes[col_indices]
+    v_groups = union_find_groups(col_boxes, v_overlap_thresh=V_OVERLAP_THRESH)
+    all_lines = []
+
+    for g in v_groups:
+        g_orig = [col_indices[i] for i in g]
+        sublines = split_group_into_lines(g_orig, boxes, median_width)
+        for sub in sublines:
+            bbox = compute_line_bbox(sub, boxes)
+            all_lines.append({"indices": sub, "bbox": bbox})
+    all_lines = sorted(all_lines, key=lambda L: L["bbox"][1])
+    return all_lines
+
+# ---------- Paragraph & wrapped line ----------
+def paragraphs_from_lines(lines):
+    heights = np.array([L["bbox"][3] - L["bbox"][1] for L in lines])
+    median_line_h = np.median(heights) if len(heights)>0 else 1.0
+    para_gap_thresh = PARA_GAP_MULT * median_line_h
+    paragraphs, cur_para = [], [lines[0]] if lines else []
+    for prev, curr in zip(lines, lines[1:]):
+        prev_bbox, curr_bbox = prev["bbox"], curr["bbox"]
+        vertical_gap = curr_bbox[1] - prev_bbox[3]
+        left_diff = abs(curr_bbox[0] - prev_bbox[0])
+        if vertical_gap <= para_gap_thresh and left_diff <= max(INDENT_THRESH, 0.2 * prev_bbox[2]):
+            cur_para.append(curr)
+        else:
+            paragraphs.append(cur_para); cur_para = [curr]
+    if cur_para: paragraphs.append(cur_para)
+    return paragraphs
+
+def merge_wrapped_lines(para, indent_thresh=LINE_INDENT_THRESH):
+    merged = []
+    i = 0
+    while i < len(para):
+        line = para[i]
+        text = line["text_joined"]
+        bbox = line["bbox"]
+
+        j = i + 1
+        while j < len(para):
+            next_line = para[j]
+            next_text = next_line["text_joined"].strip()
+            left_diff = abs(next_line["bbox"][0] - bbox[0]) < indent_thresh
+            starts_lower = next_text and next_text[0].islower()
+            starts_connector = any(next_text.lower().startswith(w) for w in ["and","or","with","of","to","for"])
+            words = next_text.split()
+            looks_like_item = (
+                bool(words) and (
+                    words[0].isupper() or
+                    words[0][0].isdigit() or
+                    words[0].endswith("=")
+                )
+            )
+            if (left_diff and (starts_lower or starts_connector)) and not looks_like_item:
+                text += " " + next_text
+                bbox = [
+                    min(bbox[0], next_line["bbox"][0]),
+                    min(bbox[1], next_line["bbox"][1]),
+                    max(bbox[2], next_line["bbox"][2]),
+                    max(bbox[3], next_line["bbox"][3])
+                ]
+                j += 1
+            else:
+                break
+
+        merged.append({"text": text, "bbox": bbox, "indices": line["indices"]})
+        i = j
+    return merged
+
+# ---------- Split wide lines into cells ----------
+def split_line_into_cells(tokens, token_boxes, line_indices, line_bbox, gap_mult=CELL_GAP_MULT):
+    if len(line_indices) <= 1:
+        return [{"text": tokens[line_indices[0]], "bbox": line_bbox}]
+
+    # Sort tokens left-to-right
+    idx_sorted = sorted(line_indices, key=lambda i: token_boxes[i][0])
+    widths = [token_boxes[i][2]-token_boxes[i][0] for i in idx_sorted]
+    median_width = np.median(widths)
+    gap_thresh = median_width * gap_mult
+
+    cells = []
+    cur_tokens = [tokens[idx_sorted[0]]]
+    cur_bbox = token_boxes[idx_sorted[0]].copy()
+
+    for i in idx_sorted[1:]:
+        bbox = token_boxes[i]
+        gap = bbox[0] - cur_bbox[2]
+        if gap > gap_thresh:
+            cells.append({"text": " ".join(cur_tokens), "bbox": cur_bbox})
+            cur_tokens = [tokens[i]]
+            cur_bbox = bbox.copy()
+        else:
+            cur_tokens.append(tokens[i])
+            cur_bbox = [
+                min(cur_bbox[0], bbox[0]),
+                min(cur_bbox[1], bbox[1]),
+                max(cur_bbox[2], bbox[2]),
+                max(cur_bbox[3], bbox[3])
+            ]
+    cells.append({"text": " ".join(cur_tokens), "bbox": cur_bbox})
+    return cells
+
+# ---------- Full column-aware pipeline ----------
+def cluster_paragraphs_from_rec_columns(rec_boxes, rec_texts):
+    boxes = boxes_from_rec(rec_boxes)
+    token_columns, col_indices_list = cluster_tokens_by_x(boxes, rec_texts)
+
+    # Sort columns left-to-right
+    columns_sorted = sorted(zip(token_columns, col_indices_list),
+                            key=lambda x: min(boxes[i,0] for i in x[1]))
+
+    all_lines = []
+    for col_tokens, col_indices in columns_sorted:
+        col_lines = lines_from_boxes_by_column(boxes, col_indices)
+        for L in col_lines:
+            indices = sorted(L["indices"], key=lambda i: boxes[i,0])
+            L["texts"] = [rec_texts[i] for i in indices]
+            L["text_joined"] = " ".join(L["texts"])
+            L["bbox"] = compute_line_bbox(indices, boxes)
+        all_lines.extend(col_lines)
+
+    # sort all lines top-to-bottom
+    all_lines = sorted(all_lines, key=lambda L: L["bbox"][1])
+    paragraphs = paragraphs_from_lines(all_lines)
+
+    para_outputs = []
+    new_rec_boxes = []
+    new_rec_texts = []
+
+    for p_idx, para in enumerate(paragraphs):
+        merged_lines = merge_wrapped_lines(para)
+        # Split wide lines into cells
+        for L in merged_lines:
+            cells = split_line_into_cells(rec_texts, boxes, L["indices"], L["bbox"])
+            for cell in cells:
+                new_rec_texts.append(cell["text"])
+                new_rec_boxes.append(cell["bbox"])
+        para_outputs.append({"id": p_idx, "texts": [t["text"] for t in merged_lines],
+                             "bboxes": [L["bbox"] for L in merged_lines]})
+
+    new_rec_boxes = np.array(new_rec_boxes, dtype=np.int32)
+    return para_outputs, new_rec_boxes, new_rec_texts
+
+
+## Result Mapping and Visualization
+
+import numpy as np
+
+def map_matches_to_original_image(all_hits: list):
+    """
+    Map matched hits back to original image coordinates.
+    Works on page → tables → hits structure.
+    Adds padding (2% top, 2% right, 3% left),
+    clipped to column boundaries.
+    """
+    mapped_boxes = []
+
+    for page_result in all_hits:
+        page_idx = page_result["page_index"]
+
+        for table_result in page_result["tables"]:
+            table = table_result["table"]
+            hits = table_result["hits"]
+
+            for match in hits:
+                tb_x1, tb_y1 = float(match['table_bbox']['x1']), float(match['table_bbox']['y1'])
+                col_idx = match['column_index']
+                col_bbox_list = match['column_bbox']
+
+                if not col_bbox_list or len(col_bbox_list) <= col_idx:
+                    continue
+
+                # column bounding box (scaled)
+                col_bbox = col_bbox_list[col_idx]
+                cb_x1, cb_y1, cb_x2, cb_y2 = [v / 4 for v in col_bbox]
+
+                word_box_local = np.array(match['word_bbox'])
+                word_box_scaled = (word_box_local / 4).astype(int)
+
+                abs_x1 = word_box_scaled[0] + cb_x1 + tb_x1
+                abs_y1 = word_box_scaled[1] + cb_y1 + tb_y1
+                abs_x2 = word_box_scaled[2] + cb_x1 + tb_x1
+                abs_y2 = word_box_scaled[3] + cb_y1 + tb_y1
+
+                # ---- Add padding ----
+                width = abs_x2 - abs_x1
+                height = abs_y2 - abs_y1
+
+                abs_y1 -= 0.02 * width     # top padding (2% of width)
+                abs_x2 += 0.02 * height    # right padding (2% of height)
+                abs_x1 -= 0.60 * height    # left padding (3% of height)
+
+                # ---- Clip to column bounds ----
+                abs_x1 = max(abs_x1, cb_x1 + tb_x1)  # left bound
+                abs_y1 = max(abs_y1, cb_y1 + tb_y1)  # top bound
+                abs_x2 = min(abs_x2, cb_x2 + tb_x1)  # right bound
+                abs_y2 = min(abs_y2, cb_y2 + tb_y1)  # bottom bound (safety)
+
+                mapped_boxes.append({
+                    "page_index": page_idx,
+                    "table": table,
+                    "term": match['term'],
+                    "orig_box": [abs_x1, abs_y1, abs_x2, abs_y2],
+                    "local_box": word_box_scaled.tolist(),
+                    "column_index": col_idx
+                })
+
+    return mapped_boxes
+
+
+from PIL import ImageDraw
+
+def draw_mapped_boxes(images, mapped_boxes, out_prefix="page"):
+    """
+    Draw mapped boxes onto their corresponding page images.
+
+    Args:
+        images: list of PIL.Image objects (indexed by page)
+        mapped_boxes: list of dicts with 'page_index' and 'orig_box'
+        out_prefix: prefix for saving output images
+
+    Returns:
+        tuple: (
+            list_of_page_indices: sorted list of page indices that had boxes drawn,
+            list_of_annotated_images: list of PIL.Image objects (clean, fully loaded),
+            list_of_saved_image_paths: full file paths of saved PNG images (optional)
+        )
+    """
+    # Group boxes by page
+    page_to_boxes = {}
+    for box_info in mapped_boxes:
+        page_idx = box_info["page_index"]
+        if page_idx < 0 or page_idx >= len(images):
+            print(f"Warning: page_index {page_idx} is out of bounds (total pages: {len(images)}), skipping.")
+            continue
+        page_to_boxes.setdefault(page_idx, []).append(box_info)
+
+    annotated_images = []   # List of PIL Image objects (in-page-order)
+    saved_image_paths = []  # Optional: paths to saved files
+    processed_page_indices = []
+
+    # Process each page that has boxes, in sorted order
+    for page_idx in sorted(page_to_boxes.keys()):
+        # Work on a copy to avoid modifying original
+        img = images[page_idx].copy()
+        draw = ImageDraw.Draw(img)
+
+        for box_info in page_to_boxes[page_idx]:
+            x1, y1, x2, y2 = map(int, box_info["orig_box"])
+            draw.rectangle([x1, y1, x2, y2], outline="Red", width=3)
+
+        # Save to disk (optional, for debugging or external use)
+        output_path = f"{out_prefix}_{page_idx}.png"
+        img.save(output_path)
+        saved_image_paths.append(output_path)
+
+        # Store clean, fully-loaded image object (no file handle dependency)
+        # Force decode and ensure RGB mode for safe PDF export later
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img.load()  # Ensure pixel data is loaded into memory
+        annotated_images.append(img)
+        processed_page_indices.append(page_idx)
+
+    print(f"Saved {len(saved_image_paths)} annotated pages: {saved_image_paths}")
+
+    return processed_page_indices, annotated_images, saved_image_paths
+
+# mapped_boxes = map_matches_to_original_image(all_hits)
+
+# draw_mapped_boxes(images, mapped_boxes, out_prefix="page")
+
+
+
+
+
+if __name__ == "__main__":
+    import sys
+    import os
+
+    # Allow passing PDF path via command line, or use a default
+    if len(sys.argv) > 1:
+        pdf_path = sys.argv[1]
+    else:
+        pdf_path = "input.pdf"  # <-- change this to your test file or ensure it exists
+
+    if not os.path.exists(pdf_path):
+        print(f"Error: File '{pdf_path}' not found.")
+        sys.exit(1)
+
+    print(f"Processing PDF: {pdf_path}")
+
+    # Run full pipeline
+    images = convert_pdf_with_pymupdf(pdf_path)
+    rec_res =layout_detect(model,images)
+    NEW = get_ocr_object_per_page(images, ocr, rec_res)
+
+    from collections import defaultdict
+
+    ocr_list = NEW
+    serial_to_pages = defaultdict(set)  # maps serial -> set of page indices
+
+    for page_idx, page in enumerate(ocr_list):
+        for elem_idx, element in enumerate(page):
+            rec_texts = element[0]['rec_texts']
+            # print(rec_texts)
+            rec_polys = element[0]['rec_polys']
+            big_text = join_ocr_texts(rec_texts, rec_polys, y_tolerance=10)
+
+            # classic serials
+            serials = find_classic_serials(big_text)
+            for s in serials:
+                serial_to_pages[s].add(page_idx)
+
+            # space-separated serials
+            serials_space = find_space_separated_codes(big_text)
+            for s in serials_space:
+                serial_to_pages[s].add(page_idx)
+
+    # flatten to lists if needed
+    serial_no = list(serial_to_pages.keys())
+    page_index = sorted({p for pages in serial_to_pages.values() for p in pages})
+
+    # select matching images/rec results
+    selected_images = [images[i] for i in page_index if i < len(images)]
+    selected_rec_res = [rec_res[i] for i in page_index if i < len(rec_res)]
+    tables_objs = []
+
+    # Iterate candidate pages
+    for page_idx, res in zip(page_index, selected_rec_res):
+        d = res.summary()
+        d_sorted = sorted(d, key=lambda x: (x['box']['y1'], x['box']['x1']))
+        for det in d_sorted:
+            if  det['name']=='figure' and det['confidence']<0.9:
+              img_array = np.array(images[page_idx])
+              cropped = crop_region(img_array, det["box"])
+              if istable(cropped):
+                det['class']=5
+        for det in d_sorted:
+            if det['class'] == 5:  # "Table" detected
+                table_bbox = det["box"]
+
+                # Crop full table from the page
+                img_array = np.array(images[page_idx])
+                table_img = crop_region(img_array, table_bbox)
+
+                # Detect columns (your process_table_image fn)
+                col_cropsi, colum_bbox = process_table_image(table_img, ocr)
+
+                columns = []
+                for col in col_cropsi:
+                    # Store bbox + image
+                    col_img_pil = Image.fromarray(col, 'RGB')
+                    col_bbox = colum_bbox  # if process_table_image returns bbox you can add it here
+
+                    # OCR each column
+                    col_result = ocr.predict(col)
+                    texts = col_result[0]['rec_texts'] if col_result else []
+                    print(texts)
+                    boxes = col_result[0]['rec_boxes'] if col_result else []
+                    para_outputs, new_rec_boxes, new_rec_texts = cluster_paragraphs_from_rec_columns(boxes, texts)
+                    print(new_rec_texts)
+                    # texts=[item["rec_texts"] for item in col_result[0]],
+                    # boxes=[item["rec_boxes"] for item in col_result[0]]
+
+                    columns.append(
+                        TableColumn(bbox=col_bbox, image=col_cropsi, texts=new_rec_texts, boxes=new_rec_boxes)
+                    )
+
+                # Build the table object
+                t = DetectedTable(
+                    page_index=page_idx,
+                    table_bbox=table_bbox,
+                    table_image=table_img,
+                    columns=columns
+                )
+                tables_objs.append(t)
+
+
+    # serial_to_pages: dict[str, set[int]] built earlier
+    for serial, page_indices in serial_to_pages.items():
+        for page_idx in page_indices:
+            print(f"Processing serial {serial} on page {page_idx}")
+            # filter tables for this page only
+            page_tables = [t for t in tables_objs if t.page_index == page_idx]
+
+            # run matching just on this page
+            found, all_hits, not_found = exact_match_in_tables(page_tables, serial)
+            print(found, not_found)
+            # map matches back to original image
+            mapped_boxes = map_matches_to_original_image(all_hits)
+
+            # draw annotations
+            processed_page_indices, annotated_images, saved_image_paths = draw_mapped_boxes(
+                images, mapped_boxes, out_prefix=f"page"
+            )
+
+
+            # replace only the images for this page
+            for idx, img in zip(processed_page_indices, annotated_images):
+                images[idx] = img
+
+    # Save final annotated PDF
+    import fitz
+    from PIL import Image
+    from io import BytesIO  # Critical import for in-memory bytes
+
+    output_pdf = "full_document_with_annotations.pdf"
+    doc = fitz.open()
+    for img in images:
+        img_byte_arr = BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        imgdoc = fitz.open(stream=img_byte_arr)
+        pdfbytes = imgdoc.convert_to_pdf()
+        doc.insert_pdf(fitz.open("pdf", pdfbytes))
+    doc.save(output_pdf)
+    print(f"✅ Annotated PDF saved as: {output_pdf}")

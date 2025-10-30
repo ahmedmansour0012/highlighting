@@ -1,0 +1,11 @@
+paddlepaddle==3.1.1
+paddleocr==3.2.0
+fuzzywuzzy 
+python-Levenshtein
+PyPDF2
+pdf2image
+pypdfium2
+doclayout-yolo
+PyMuPDF
+PySerialNumbers
+surya-ocr==0.16.1
