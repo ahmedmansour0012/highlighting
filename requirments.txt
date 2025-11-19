@@ -9,3 +9,4 @@ doclayout-yolo
 PyMuPDF
 PySerialNumbers
 surya-ocr==0.16.1
+flask
