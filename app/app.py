@@ -71,12 +71,12 @@ def highlight():
 
         # ---- Run pipeline with FILE PATH (not bytes) ----
         if detect:
-            result_path = run_pipeline_detect(temp_path, output_pdf=output_path)
+            result_path ,serial_numbers  = run_pipeline_detect(temp_path, output_pdf=output_path)
         else:
             # Validate serial_number if needed (e.g., not empty)
             if not serial_numbers:
                 return jsonify({"error": "serial_number is required in non-detect mode"}), 400
-            result_path = run_pipeline_serial(temp_path, serial_numbers, output_pdf=output_path)
+            result_path = run_pipeline_serial(temp_path, serial_numbers)
 
         # ---- Verify output file exists ----
         if not result_path or not os.path.exists(result_path):
@@ -85,7 +85,7 @@ def highlight():
         return jsonify({
             "success": True,
             "message": "PDF processed and annotated successfully.",
-            "output_file": result_path,
+            "output_file": OUTPUT_FOLDER,
             "serial_number_used": serial_numbers,
             "auto_detect_mode": detect
         })
