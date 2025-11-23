@@ -19,7 +19,7 @@ from core.serial_extraction.page_finder import find_pages, match_serials_to_page
 from core.serial_extraction.parsing import _split_serial
 
 
-def run_pipeline_serial(pdf_path, serial_no ,output_pdf = "full_document_with_annotations.pdf"):
+def run_pipeline_serial(pdf_path, serial_no ,output_folder="outputs"):
     print(serial_no)
     serial_parts = set()
     for serial in serial_no:
@@ -112,7 +112,7 @@ def run_pipeline_serial(pdf_path, serial_no ,output_pdf = "full_document_with_an
                 print(f"  No matches found on page {page_idx} for serial {serial}")
         
         # Step 6: Save annotated PDF (only once per serial)
-        output_pdf = f"outputs/{serial}.pdf"
+        output_pdf = f"{output_folder}/{serial}.pdf"
         doc = fitz.open()
         for img in images_copy:
             img_byte_arr = BytesIO()
@@ -143,7 +143,7 @@ def run_pipeline_detect(pdf_path, output_pdf = "full_document_with_annotations_d
         raise FileNotFoundError(f"Input PDF not found: {pdf_path}")
 
     print(f"Processing PDF: {pdf_path}")
-
+    main_serials = []  # In detect mode, we don't have predefined serials
     ocr = get_ocr_instance()
     
     # Step 1: Convert PDF to images
@@ -225,7 +225,7 @@ def run_pipeline_detect(pdf_path, output_pdf = "full_document_with_annotations_d
             page_tables = [t for t in tables_objs if t.page_index == page_idx]
             found, all_hits, not_found = exact_match_in_tables(page_tables, serial)
             mapped_boxes = map_matches_to_original_image(all_hits)
-            
+            main_serials.append(serial)
             processed_page_indices, annotated_images, _ = draw_mapped_boxes(
                 images, mapped_boxes, out_prefix=f"page"
             )
@@ -245,5 +245,5 @@ def run_pipeline_detect(pdf_path, output_pdf = "full_document_with_annotations_d
     doc.save(output_pdf)
     print(f"✅ Annotated PDF saved as: {output_pdf}")
     
-    return output_pdf
+    return output_pdf, main_serials
 
